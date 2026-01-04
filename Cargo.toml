@@ -7,6 +7,7 @@ edition = "2024"
 walkdir = "*"
 encoding_rs = "*"
 encoding_rs_io = "*"
+dialoguer = "*"
 
 [profile.release]
 opt-level = 3
