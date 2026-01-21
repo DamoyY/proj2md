@@ -5,6 +5,7 @@ use std::{
     io::{self, BufRead as _, Write as _},
     path::Path,
 };
+
 use encoding_rs::UTF_16LE;
 use ignore::WalkBuilder;
 const OUTPUT_FILENAME: &str = "project.md";
