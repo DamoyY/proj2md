@@ -6,34 +6,37 @@ use std::{
     path::Path,
 };
 
-use encoding_rs::UTF_16LE;
+use chardetng::EncodingDetector;
+use encoding_rs::Encoding;
 use ignore::WalkBuilder;
 const OUTPUT_FILENAME: &str = "project.md";
 const EXTRA_EXCLUDED_FILES: [&str; 2] = ["LICENSE", "README.md"];
 fn read_file_content(path: &Path) -> Result<String, Box<dyn core::error::Error>> {
-    match fs::read_to_string(path) {
-        Ok(content) => return Ok(content),
-        Err(err) => {
-            if err.kind() != io::ErrorKind::InvalidData {
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("读取文件失败: {}", path.display()),
-                )
-                .into());
-            }
-        }
-    }
     let bytes = fs::read(path)
         .map_err(|err| io::Error::new(err.kind(), format!("读取文件失败: {}", path.display())))?;
-    let (result, _, had_errors) = UTF_16LE.decode(&bytes);
-    if had_errors {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("文件内容无法以 UTF-8 或 UTF-16LE 解码: {}", path.display()),
-        )
-        .into());
+    if let Some((encoding, bom_len)) = Encoding::for_bom(&bytes) {
+        let bytes_no_bom = bytes.get(bom_len..).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("BOM 长度异常: {}", path.display()),
+            )
+        })?;
+        let (text, _, had_errors) = encoding.decode(bytes_no_bom);
+        if !had_errors {
+            return Ok(text.into_owned());
+        }
     }
-    Ok(result.into_owned())
+    if let Ok(text) = core::str::from_utf8(&bytes) {
+        return Ok(text.to_owned());
+    }
+    let mut detector = EncodingDetector::new();
+    detector.feed(&bytes, true);
+    let encoding = detector.guess(None, true);
+    let (text, _, had_errors) = encoding.decode(&bytes);
+    if !had_errors {
+        return Ok(text.into_owned());
+    }
+    Ok("(解码失败)".to_owned())
 }
 fn generate_directory_tree(root_path: &Path) -> Result<String, Box<dyn core::error::Error>> {
     let mut tree_str = String::from("## 1. 目录结构\n\n");
