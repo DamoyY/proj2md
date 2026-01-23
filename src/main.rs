@@ -11,9 +11,39 @@ use encoding_rs::Encoding;
 use ignore::WalkBuilder;
 const OUTPUT_FILENAME: &str = "project.md";
 const EXTRA_EXCLUDED_FILES: [&str; 2] = ["LICENSE", "README.md"];
+fn is_binary(bytes: &[u8]) -> Result<bool, io::Error> {
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    let mut total = 0_usize;
+    let mut control = 0_usize;
+    for &byte in bytes.iter().take(8192) {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "统计字节数时发生溢出"))?;
+        if byte == 0 {
+            return Ok(true);
+        }
+        if byte < 0x09 || (byte > 0x0D && byte < 0x20) {
+            control = control.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "统计控制字符时发生溢出")
+            })?;
+        }
+    }
+    let control_scaled = control
+        .checked_mul(100)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "计算控制字符比例时发生溢出"))?;
+    let total_scaled = total
+        .checked_mul(30)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "计算字节总数比例时发生溢出"))?;
+    Ok(control_scaled > total_scaled)
+}
 fn read_file_content(path: &Path) -> Result<String, Box<dyn core::error::Error>> {
     let bytes = fs::read(path)
         .map_err(|err| io::Error::new(err.kind(), format!("读取文件失败: {}", path.display())))?;
+    if is_binary(&bytes)? {
+        return Ok("(二进制文件)".to_owned());
+    }
     if let Some((encoding, bom_len)) = Encoding::for_bom(&bytes) {
         let bytes_no_bom = bytes.get(bom_len..).ok_or_else(|| {
             io::Error::new(
