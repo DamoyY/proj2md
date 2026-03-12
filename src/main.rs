@@ -10,6 +10,11 @@ use encoding_rs::Encoding;
 use ignore::WalkBuilder;
 const OUTPUT_FILENAME: &str = "project.md";
 const EXTRA_EXCLUDED_FILES: [&str; 2] = ["LICENSE", "README.md"];
+fn build_walk(root_path: &Path) -> ignore::Walk {
+    let mut builder = WalkBuilder::new(root_path);
+    builder.require_git(false);
+    builder.build()
+}
 fn is_binary(bytes: &[u8]) -> Result<bool, io::Error> {
     if bytes.is_empty() {
         return Ok(false);
@@ -84,7 +89,7 @@ fn generate_directory_tree(root_path: &Path) -> Result<String, Box<dyn core::err
         })?,
     };
     writeln!(tree_str, "{root_name}/")?;
-    for entry_result in WalkBuilder::new(root_path).build() {
+    for entry_result in build_walk(root_path) {
         let entry = entry_result.map_err(|err| io::Error::other(format!("遍历目录失败: {err}")))?;
         let path = entry.path();
         let rel_path = path.strip_prefix(root_path).map_err(|err| {
@@ -130,7 +135,7 @@ fn generate_directory_tree(root_path: &Path) -> Result<String, Box<dyn core::err
 }
 fn generate_file_contents(root_path: &Path) -> Result<String, Box<dyn core::error::Error>> {
     let mut content_str = String::from("\n## 2. 文件内容\n\n");
-    for entry_result in WalkBuilder::new(root_path).build() {
+    for entry_result in build_walk(root_path) {
         let entry = entry_result.map_err(|err| io::Error::other(format!("遍历目录失败: {err}")))?;
         let file_type = entry.file_type().ok_or_else(|| {
             io::Error::other(format!("无法获取文件类型: {}", entry.path().display()))
@@ -192,9 +197,7 @@ fn get_input_path() -> Result<String, io::Error> {
     let cwd = env::current_dir()?;
     Ok(cwd.to_string_lossy().to_string())
 }
-fn write_output_file(
-    content: &str,
-) -> Result<PathBuf, Box<dyn core::error::Error>> {
+fn write_output_file(content: &str) -> Result<PathBuf, Box<dyn core::error::Error>> {
     let temp_dir = env::temp_dir().join("proj2md");
     fs::create_dir_all(&temp_dir).map_err(|err| {
         io::Error::new(
@@ -202,7 +205,7 @@ fn write_output_file(
             format!("创建临时目录失败: {}: {err}", temp_dir.display()),
         )
     })?;
-    let output_file_name = format!("{OUTPUT_FILENAME}");
+    let output_file_name = OUTPUT_FILENAME.to_owned();
     let output_path = temp_dir.join(output_file_name);
     fs::write(&output_path, content).map_err(|err| {
         io::Error::new(
@@ -230,12 +233,11 @@ fn copy_file_to_clipboard(file_path: &Path) -> Result<(), Box<dyn core::error::E
                 "-Command",
                 "$ErrorActionPreference='Stop'; \
                  [Console]::InputEncoding=[System.Text.Encoding]::UTF8; \
-                 $path=[Console]::In.ReadToEnd(); \
-                 if ([string]::IsNullOrWhiteSpace($path)) { throw '未收到输出文件路径' }; \
-                 if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw \"输出文件不存在: $path\" }; \
-                 Add-Type -AssemblyName System.Windows.Forms; \
-                 $files=New-Object System.Collections.Specialized.StringCollection; \
-                 $null=$files.Add($path); \
+                 $path=[Console]::In.ReadToEnd(); if ([string]::IsNullOrWhiteSpace($path)) { \
+                 throw '未收到输出文件路径' }; if (-not (Test-Path -LiteralPath $path -PathType \
+                 Leaf)) { throw \"输出文件不存在: $path\" }; Add-Type -AssemblyName \
+                 System.Windows.Forms; $files=New-Object \
+                 System.Collections.Specialized.StringCollection; $null=$files.Add($path); \
                  [System.Windows.Forms.Clipboard]::SetFileDropList($files)",
             ])
             .stdin(Stdio::piped())
@@ -285,10 +287,6 @@ fn run() -> Result<(), Box<dyn core::error::Error>> {
             format!("路径不是目录: {path_str}"),
         )
         .into());
-    }
-    let gitignore_path = root_path.join(".gitignore");
-    if !gitignore_path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, ".gitignore 文件不存在").into());
     }
     println!("正在生成文档...");
     let tree_part = generate_directory_tree(root_path)?;
