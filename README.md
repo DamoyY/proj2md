@@ -38,7 +38,7 @@ cargo run --release
 
 ## 输出格式
 
-运行成功后，工具会在目标项目的根目录下生成一个名为 `project.md` 的文件。
+运行成功后，工具会把 `project.md` 的文件复制到剪贴板。
 
 **project.md 示例：**
 

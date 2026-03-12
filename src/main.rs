@@ -1,9 +1,8 @@
 use core::fmt::Write as _;
 use std::{
-    env,
-    fs::{self, File},
+    env, fs,
     io::{self, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use chardetng::EncodingDetector;
@@ -193,6 +192,85 @@ fn get_input_path() -> Result<String, io::Error> {
     let cwd = env::current_dir()?;
     Ok(cwd.to_string_lossy().to_string())
 }
+fn write_output_file(
+    content: &str,
+) -> Result<PathBuf, Box<dyn core::error::Error>> {
+    let temp_dir = env::temp_dir().join("proj2md");
+    fs::create_dir_all(&temp_dir).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("创建临时目录失败: {}: {err}", temp_dir.display()),
+        )
+    })?;
+    let output_file_name = format!("{OUTPUT_FILENAME}");
+    let output_path = temp_dir.join(output_file_name);
+    fs::write(&output_path, content).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("写入输出文件失败: {}: {err}", output_path.display()),
+        )
+    })?;
+    Ok(output_path)
+}
+fn copy_file_to_clipboard(file_path: &Path) -> Result<(), Box<dyn core::error::Error>> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::{Command, Stdio};
+
+        let file_path_str = file_path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("输出路径包含无效 UTF-8: {}", file_path.display()),
+            )
+        })?;
+        let mut child = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                "$ErrorActionPreference='Stop'; \
+                 [Console]::InputEncoding=[System.Text.Encoding]::UTF8; \
+                 $path=[Console]::In.ReadToEnd(); \
+                 if ([string]::IsNullOrWhiteSpace($path)) { throw '未收到输出文件路径' }; \
+                 if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw \"输出文件不存在: $path\" }; \
+                 Add-Type -AssemblyName System.Windows.Forms; \
+                 $files=New-Object System.Collections.Specialized.StringCollection; \
+                 $null=$files.Add($path); \
+                 [System.Windows.Forms.Clipboard]::SetFileDropList($files)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| io::Error::new(err.kind(), format!("启动 PowerShell 失败: {err}")))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "无法获取 PowerShell 标准输入")
+        })?;
+        stdin.write_all(file_path_str.as_bytes()).map_err(|err| {
+            io::Error::new(err.kind(), format!("向 PowerShell 写入内容失败: {err}"))
+        })?;
+        drop(stdin);
+        let output = child.wait_with_output().map_err(|err| {
+            io::Error::new(err.kind(), format!("等待 PowerShell 结束失败: {err}"))
+        })?;
+        if !output.status.success() {
+            let stderr_text = String::from_utf8(output.stderr).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("解析错误输出失败: {err}"),
+                )
+            })?;
+            return Err(io::Error::other(format!("复制到剪贴板失败: {stderr_text}")).into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = file_path;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "当前平台暂不支持复制到剪贴板").into())
+    }
+}
 fn run() -> Result<(), Box<dyn core::error::Error>> {
     let path_str = get_input_path()?;
     let root_path = Path::new(&path_str);
@@ -216,10 +294,9 @@ fn run() -> Result<(), Box<dyn core::error::Error>> {
     let tree_part = generate_directory_tree(root_path)?;
     let content_part = generate_file_contents(root_path)?;
     let final_content = format!("{tree_part}{content_part}");
-    let output_path = root_path.join(OUTPUT_FILENAME);
-    let mut file = File::create(&output_path)?;
-    file.write_all(final_content.as_bytes())?;
-    println!("文档已生成: {}", output_path.display());
+    let output_path = write_output_file(&final_content)?;
+    copy_file_to_clipboard(&output_path)?;
+    println!("文档文件已复制到剪贴板: {}", output_path.display());
     Ok(())
 }
 fn main() {
