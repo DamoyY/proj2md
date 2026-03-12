@@ -1,20 +1,297 @@
-use core::fmt::Write as _;
 use std::{
-    env, fs,
-    io::{self, Write as _},
+    env,
+    ffi::OsStr,
+    fs,
+    io::{self, BufWriter, Write as _},
     path::{Path, PathBuf},
 };
 
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use ignore::WalkBuilder;
+
 const OUTPUT_FILENAME: &str = "project.md";
 const EXTRA_EXCLUDED_FILES: [&str; 2] = ["LICENSE", "README.md"];
+
+#[derive(Debug)]
+struct FileEntry {
+    absolute_path: PathBuf,
+    relative_path: String,
+    code_block_language: String,
+}
+
+#[cfg(target_os = "windows")]
+mod windows_clipboard {
+    use core::{
+        ffi::c_void,
+        mem::size_of,
+        ptr::{self, null_mut},
+    };
+    use std::{io, os::windows::ffi::OsStrExt as _, path::Path};
+
+    const CF_HDROP: u32 = 15;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    type Bool = i32;
+    type Handle = *mut c_void;
+    type Hglobal = *mut c_void;
+    type Hwnd = *mut c_void;
+    type Uint = u32;
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C)]
+    struct DropFiles {
+        p_files: u32,
+        pt: Point,
+        f_nc: Bool,
+        f_wide: Bool,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(new_owner: Hwnd) -> Bool;
+        fn EmptyClipboard() -> Bool;
+        fn SetClipboardData(format: Uint, memory: Handle) -> Handle;
+        fn CloseClipboard() -> Bool;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: Uint, bytes: usize) -> Hglobal;
+        fn GlobalLock(memory: Hglobal) -> *mut c_void;
+        fn GlobalUnlock(memory: Hglobal) -> Bool;
+        fn GlobalFree(memory: Hglobal) -> Hglobal;
+        fn GetLastError() -> u32;
+    }
+
+    fn win32_error(action: &str, code: u32) -> io::Error {
+        i32::try_from(code).map_or_else(
+            |_| io::Error::other(format!("{action}: Win32 错误码 {code}")),
+            |raw_code| {
+                io::Error::other(format!(
+                    "{action}: {}",
+                    io::Error::from_raw_os_error(raw_code)
+                ))
+            },
+        )
+    }
+
+    fn last_os_error(action: &str) -> io::Error {
+        // SAFETY: GetLastError 不接收参数，也不会解引用任何 Rust 指针。
+        let code = unsafe { GetLastError() };
+        if code == 0 {
+            return io::Error::other(action.to_owned());
+        }
+        win32_error(action, code)
+    }
+
+    fn allocate_global_memory(size: usize) -> io::Result<Hglobal> {
+        // SAFETY: GlobalAlloc 只读取传入的大小和值，不会触碰 Rust 管理的内存。
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, size) };
+        if memory.is_null() {
+            return Err(last_os_error("分配全局内存失败"));
+        }
+        Ok(memory)
+    }
+
+    fn free_global_memory(memory: Hglobal) -> io::Result<()> {
+        // SAFETY: 句柄由 GlobalAlloc 返回，调用方保证这里传入的仍是待释放的全局内存句柄。
+        let result = unsafe { GlobalFree(memory) };
+        if result.is_null() {
+            return Ok(());
+        }
+        Err(last_os_error("释放全局内存失败"))
+    }
+
+    fn lock_global_memory(memory: Hglobal) -> io::Result<*mut u8> {
+        // SAFETY: 句柄由 GlobalAlloc 返回，GlobalLock 只返回对应内存块的基地址。
+        let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
+        if pointer.is_null() {
+            return Err(last_os_error("锁定全局内存失败"));
+        }
+        Ok(pointer)
+    }
+
+    fn unlock_global_memory(memory: Hglobal) -> io::Result<()> {
+        // SAFETY: 句柄已成功传给 GlobalLock，这里按 Win32 约定对同一块内存解锁。
+        if unsafe { GlobalUnlock(memory) } == 0_i32 {
+            // SAFETY: GetLastError 不接收参数，也不会解引用任何 Rust 指针。
+            let code = unsafe { GetLastError() };
+            if code != 0 {
+                return Err(win32_error("解锁全局内存失败", code));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_file_drop_handle(file_path: &Path) -> io::Result<Hglobal> {
+        let mut wide_path: Vec<u16> = file_path.as_os_str().encode_wide().collect();
+        wide_path.push(0);
+        wide_path.push(0);
+
+        let header_size = size_of::<DropFiles>();
+        let header_offset = u32::try_from(header_size).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("DROPFILES 头部大小超出 Win32 范围: {err}"),
+            )
+        })?;
+        let path_bytes = wide_path
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "计算路径缓冲区大小时发生溢出")
+            })?;
+        let total_size = header_size.checked_add(path_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "计算剪贴板数据大小时发生溢出")
+        })?;
+
+        let memory = allocate_global_memory(total_size)?;
+        let buffer = match lock_global_memory(memory) {
+            Ok(pointer) => pointer,
+            Err(err) => {
+                if let Err(free_err) = free_global_memory(memory) {
+                    return Err(io::Error::other(format!(
+                        "{err}; 释放全局内存失败: {free_err}"
+                    )));
+                }
+                return Err(err);
+            }
+        };
+
+        let header = DropFiles {
+            p_files: header_offset,
+            pt: Point { x: 0, y: 0 },
+            f_nc: 0_i32,
+            f_wide: 1_i32,
+        };
+        // SAFETY: buffer 指向一块至少 total_size 字节的可写全局内存，这里只复制固定大小的头部字节。
+        unsafe {
+            ptr::copy_nonoverlapping(ptr::from_ref(&header).cast::<u8>(), buffer, header_size);
+        }
+        let path_buffer = buffer.wrapping_add(header_size);
+        // SAFETY: path_buffer 指向头部之后的连续可写空间，长度至少为 path_bytes 字节。
+        unsafe {
+            ptr::copy_nonoverlapping(wide_path.as_ptr().cast::<u8>(), path_buffer, path_bytes);
+        }
+
+        if let Err(err) = unlock_global_memory(memory) {
+            if let Err(free_err) = free_global_memory(memory) {
+                return Err(io::Error::other(format!(
+                    "{err}; 释放全局内存失败: {free_err}"
+                )));
+            }
+            return Err(err);
+        }
+
+        Ok(memory)
+    }
+
+    fn set_clipboard_file_drop(memory: Hglobal) -> io::Result<()> {
+        // SAFETY: 传入空窗口句柄表示当前任务线程访问系统剪贴板，不涉及 Rust 引用失效。
+        if unsafe { OpenClipboard(null_mut()) } == 0_i32 {
+            return Err(last_os_error("打开剪贴板失败"));
+        }
+
+        let operation_result = {
+            // SAFETY: 剪贴板已成功打开，按 Win32 约定可以直接清空其内容。
+            let empty_result = unsafe { EmptyClipboard() };
+            if empty_result == 0_i32 {
+                Err(last_os_error("清空剪贴板失败"))
+            } else {
+                // SAFETY: memory 指向一块 GMEM_MOVEABLE 全局内存，格式与 CF_HDROP 要求一致。
+                let set_result = unsafe { SetClipboardData(CF_HDROP, memory.cast()) };
+                if set_result.is_null() {
+                    Err(last_os_error("写入剪贴板失败"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        let close_result = {
+            // SAFETY: 只有当前函数打开了剪贴板，因此这里必须在返回前关闭。
+            let close_status = unsafe { CloseClipboard() };
+            if close_status == 0_i32 {
+                Err(last_os_error("关闭剪贴板失败"))
+            } else {
+                Ok(())
+            }
+        };
+
+        match (operation_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(operation_error), Ok(())) => Err(operation_error),
+            (Ok(()), Err(close_error)) => Err(close_error),
+            (Err(operation_error), Err(close_error)) => Err(io::Error::other(format!(
+                "{operation_error}; {close_error}"
+            ))),
+        }
+    }
+
+    pub(crate) fn copy_file_to_clipboard(file_path: &Path) -> io::Result<()> {
+        let memory = build_file_drop_handle(file_path)?;
+        if let Err(err) = set_clipboard_file_drop(memory) {
+            if let Err(free_err) = free_global_memory(memory) {
+                return Err(io::Error::other(format!(
+                    "{err}; 释放全局内存失败: {free_err}"
+                )));
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
 fn build_walk(root_path: &Path) -> ignore::Walk {
     let mut builder = WalkBuilder::new(root_path);
     builder.require_git(false);
     builder.build()
 }
+
+fn os_str_to_utf8<'os>(
+    os_value: Option<&'os OsStr>,
+    display_path: &Path,
+    subject: &str,
+) -> Result<&'os str, io::Error> {
+    let resolved_value = os_value.ok_or_else(|| {
+        io::Error::other(format!("无法获取{subject}: {}", display_path.display()))
+    })?;
+    resolved_value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{subject}包含无效 UTF-8: {}", display_path.display()),
+        )
+    })
+}
+
+fn path_to_utf8<'path>(path: &'path Path, subject: &str) -> Result<&'path str, io::Error> {
+    path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{subject}包含无效 UTF-8: {}", path.display()),
+        )
+    })
+}
+
+fn root_name(root_path: &Path) -> Result<&str, io::Error> {
+    root_path.file_name().map_or_else(
+        || path_to_utf8(root_path, "根路径"),
+        |name| os_str_to_utf8(Some(name), root_path, "根目录名"),
+    )
+}
+
+fn is_excluded_file(file_name: &str) -> bool {
+    file_name == OUTPUT_FILENAME || EXTRA_EXCLUDED_FILES.contains(&file_name)
+}
+
 fn is_binary(bytes: &[u8]) -> Result<bool, io::Error> {
     if bytes.is_empty() {
         return Ok(false);
@@ -42,6 +319,7 @@ fn is_binary(bytes: &[u8]) -> Result<bool, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "计算字节总数比例时发生溢出"))?;
     Ok(control_scaled > total_scaled)
 }
+
 fn read_file_content(path: &Path) -> Result<String, Box<dyn core::error::Error>> {
     let bytes = fs::read(path)
         .map_err(|err| io::Error::new(err.kind(), format!("读取文件失败: {}", path.display())))?;
@@ -72,23 +350,16 @@ fn read_file_content(path: &Path) -> Result<String, Box<dyn core::error::Error>>
     }
     Ok("(解码失败)".to_owned())
 }
-fn generate_directory_tree(root_path: &Path) -> Result<String, Box<dyn core::error::Error>> {
-    let mut tree_str = String::from("## 1. 目录结构\n\n");
-    let root_name = match root_path.file_name() {
-        Some(name) => name.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("根目录名包含无效 UTF-8: {}", root_path.display()),
-            )
-        })?,
-        None => root_path.as_os_str().to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("根路径包含无效 UTF-8: {}", root_path.display()),
-            )
-        })?,
-    };
-    writeln!(tree_str, "{root_name}/")?;
+
+fn collect_files_and_write_directory_tree<W: io::Write>(
+    root_path: &Path,
+    writer: &mut W,
+) -> Result<Vec<FileEntry>, Box<dyn core::error::Error>> {
+    writer.write_all("## 1. 目录结构\n\n".as_bytes())?;
+    writeln!(writer, "{}/", root_name(root_path)?)?;
+
+    let mut files = Vec::new();
+
     for entry_result in build_walk(root_path) {
         let entry = entry_result.map_err(|err| io::Error::other(format!("遍历目录失败: {err}")))?;
         let path = entry.path();
@@ -98,106 +369,73 @@ fn generate_directory_tree(root_path: &Path) -> Result<String, Box<dyn core::err
         if rel_path.as_os_str().is_empty() {
             continue;
         }
+
         let depth = rel_path.components().count();
         let indent = "    ".repeat(depth);
         let file_type = entry
             .file_type()
             .ok_or_else(|| io::Error::other(format!("无法获取文件类型: {}", path.display())))?;
+
         if file_type.is_dir() {
-            let dir_name = path
-                .file_name()
-                .ok_or_else(|| io::Error::other(format!("无法获取目录名: {}", path.display())))?
-                .to_str()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("目录名包含无效 UTF-8: {}", path.display()),
-                    )
-                })?;
-            writeln!(tree_str, "{indent}{dir_name}/")?;
-        } else {
-            let file_name = path
-                .file_name()
-                .ok_or_else(|| io::Error::other(format!("无法获取文件名: {}", path.display())))?
-                .to_str()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("文件名包含无效 UTF-8: {}", path.display()),
-                    )
-                })?;
-            if file_name != OUTPUT_FILENAME && !EXTRA_EXCLUDED_FILES.contains(&file_name) {
-                writeln!(tree_str, "{indent}{file_name}")?;
-            }
-        }
-    }
-    Ok(tree_str)
-}
-fn generate_file_contents(root_path: &Path) -> Result<String, Box<dyn core::error::Error>> {
-    let mut content_str = String::from("\n## 2. 文件内容\n\n");
-    for entry_result in build_walk(root_path) {
-        let entry = entry_result.map_err(|err| io::Error::other(format!("遍历目录失败: {err}")))?;
-        let file_type = entry.file_type().ok_or_else(|| {
-            io::Error::other(format!("无法获取文件类型: {}", entry.path().display()))
-        })?;
-        if file_type.is_dir() {
+            let dir_name = os_str_to_utf8(path.file_name(), path, "目录名")?;
+            writeln!(writer, "{indent}{dir_name}/")?;
             continue;
         }
-        let path = entry.path();
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| io::Error::other(format!("无法获取文件名: {}", path.display())))?
-            .to_str()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("文件名包含无效 UTF-8: {}", path.display()),
-                )
-            })?;
-        if file_name == OUTPUT_FILENAME || EXTRA_EXCLUDED_FILES.contains(&file_name) {
+
+        let file_name = os_str_to_utf8(path.file_name(), path, "文件名")?;
+        if is_excluded_file(file_name) {
             continue;
         }
-        let rel_path = path
-            .strip_prefix(root_path)
-            .map_err(|err| {
-                io::Error::other(format!("无法计算相对路径: {}: {err}", path.display()))
-            })?
-            .to_str()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("相对路径包含无效 UTF-8: {}", path.display()),
-                )
-            })?;
-        let ext = match Path::new(file_name).extension() {
-            Some(ext) => ext.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("文件扩展名包含无效 UTF-8: {}", path.display()),
-                )
-            })?,
-            None => "",
+
+        writeln!(writer, "{indent}{file_name}")?;
+
+        let relative_path = path_to_utf8(rel_path, "相对路径")?.to_owned();
+        let code_block_language = match path.extension() {
+            Some(extension) => os_str_to_utf8(Some(extension), path, "文件扩展名")?.to_owned(),
+            None => String::new(),
         };
-        writeln!(content_str, "### {rel_path}")?;
-        writeln!(content_str, "```{ext}")?;
-        let file_content = read_file_content(path)?;
-        content_str.push_str(&file_content);
+
+        files.push(FileEntry {
+            absolute_path: path.to_path_buf(),
+            relative_path,
+            code_block_language,
+        });
+    }
+
+    Ok(files)
+}
+
+fn write_file_contents<W: io::Write>(
+    files: &[FileEntry],
+    writer: &mut W,
+) -> Result<(), Box<dyn core::error::Error>> {
+    writer.write_all("\n## 2. 文件内容\n\n".as_bytes())?;
+
+    for file in files {
+        writeln!(writer, "### {}", file.relative_path)?;
+        writeln!(writer, "```{}", file.code_block_language)?;
+        let file_content = read_file_content(&file.absolute_path)?;
+        writer.write_all(file_content.as_bytes())?;
         if !file_content.ends_with('\n') {
-            content_str.push('\n');
+            writer.write_all(b"\n")?;
         }
-        content_str.push_str("```\n\n");
+        writer.write_all(b"```\n\n")?;
     }
-    Ok(content_str)
+
+    Ok(())
 }
+
 fn get_input_path() -> Result<String, io::Error> {
-    let args: Vec<String> = env::args().collect();
-    if let Some(path) = args.get(1) {
-        return Ok(path.clone());
-    }
-    let cwd = env::current_dir()?;
-    Ok(cwd.to_string_lossy().to_string())
+    env::args().nth(1).map_or_else(
+        || {
+            let cwd = env::current_dir()?;
+            Ok(cwd.to_string_lossy().to_string())
+        },
+        Ok,
+    )
 }
-fn write_output_file(content: &str) -> Result<PathBuf, Box<dyn core::error::Error>> {
+
+fn create_output_writer() -> Result<(PathBuf, BufWriter<fs::File>), Box<dyn core::error::Error>> {
     let temp_dir = env::temp_dir().join("proj2md");
     fs::create_dir_all(&temp_dir).map_err(|err| {
         io::Error::new(
@@ -205,65 +443,30 @@ fn write_output_file(content: &str) -> Result<PathBuf, Box<dyn core::error::Erro
             format!("创建临时目录失败: {}: {err}", temp_dir.display()),
         )
     })?;
-    let output_file_name = OUTPUT_FILENAME.to_owned();
-    let output_path = temp_dir.join(output_file_name);
-    fs::write(&output_path, content).map_err(|err| {
+
+    let output_path = temp_dir.join(OUTPUT_FILENAME);
+    let file = fs::File::create(&output_path).map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("写入输出文件失败: {}: {err}", output_path.display()),
+            format!("创建输出文件失败: {}: {err}", output_path.display()),
         )
     })?;
+
+    Ok((output_path, BufWriter::new(file)))
+}
+
+fn write_output_file(root_path: &Path) -> Result<PathBuf, Box<dyn core::error::Error>> {
+    let (output_path, mut writer) = create_output_writer()?;
+    let files = collect_files_and_write_directory_tree(root_path, &mut writer)?;
+    write_file_contents(&files, &mut writer)?;
+    writer.flush()?;
     Ok(output_path)
 }
+
 fn copy_file_to_clipboard(file_path: &Path) -> Result<(), Box<dyn core::error::Error>> {
     #[cfg(target_os = "windows")]
     {
-        use std::process::{Command, Stdio};
-
-        let file_path_str = file_path.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("输出路径包含无效 UTF-8: {}", file_path.display()),
-            )
-        })?;
-        let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-STA",
-                "-Command",
-                "$ErrorActionPreference='Stop'; \
-                 [Console]::InputEncoding=[System.Text.Encoding]::UTF8; \
-                 $path=[Console]::In.ReadToEnd(); if ([string]::IsNullOrWhiteSpace($path)) { \
-                 throw '未收到输出文件路径' }; if (-not (Test-Path -LiteralPath $path -PathType \
-                 Leaf)) { throw \"输出文件不存在: $path\" }; Add-Type -AssemblyName \
-                 System.Windows.Forms; $files=New-Object \
-                 System.Collections.Specialized.StringCollection; $null=$files.Add($path); \
-                 [System.Windows.Forms.Clipboard]::SetFileDropList($files)",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| io::Error::new(err.kind(), format!("启动 PowerShell 失败: {err}")))?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "无法获取 PowerShell 标准输入")
-        })?;
-        stdin.write_all(file_path_str.as_bytes()).map_err(|err| {
-            io::Error::new(err.kind(), format!("向 PowerShell 写入内容失败: {err}"))
-        })?;
-        drop(stdin);
-        let output = child.wait_with_output().map_err(|err| {
-            io::Error::new(err.kind(), format!("等待 PowerShell 结束失败: {err}"))
-        })?;
-        if !output.status.success() {
-            let stderr_text = String::from_utf8(output.stderr).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("解析错误输出失败: {err}"),
-                )
-            })?;
-            return Err(io::Error::other(format!("复制到剪贴板失败: {stderr_text}")).into());
-        }
+        windows_clipboard::copy_file_to_clipboard(file_path)?;
         Ok(())
     }
 
@@ -273,6 +476,7 @@ fn copy_file_to_clipboard(file_path: &Path) -> Result<(), Box<dyn core::error::E
         Err(io::Error::new(io::ErrorKind::Unsupported, "当前平台暂不支持复制到剪贴板").into())
     }
 }
+
 fn run() -> Result<(), Box<dyn core::error::Error>> {
     let path_str = get_input_path()?;
     let root_path = Path::new(&path_str);
@@ -289,14 +493,12 @@ fn run() -> Result<(), Box<dyn core::error::Error>> {
         .into());
     }
     println!("正在生成文档...");
-    let tree_part = generate_directory_tree(root_path)?;
-    let content_part = generate_file_contents(root_path)?;
-    let final_content = format!("{tree_part}{content_part}");
-    let output_path = write_output_file(&final_content)?;
+    let output_path = write_output_file(root_path)?;
     copy_file_to_clipboard(&output_path)?;
     println!("文档文件已复制到剪贴板: {}", output_path.display());
     Ok(())
 }
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("错误: {err}");
