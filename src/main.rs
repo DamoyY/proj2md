@@ -1,6 +1,7 @@
-use chardetng::EncodingDetector;
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::Encoding;
 use ignore::WalkBuilder;
+use mimalloc::MiMalloc;
 use std::{
     env,
     ffi::OsStr,
@@ -8,6 +9,8 @@ use std::{
     io::{self, BufWriter, Write as _},
     path::{Path, PathBuf},
 };
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 const OUTPUT_FILENAME: &str = "project.md";
 const EXTRA_EXCLUDED_FILES: [&str; 2] = ["LICENSE", "README.md"];
 #[derive(Debug)]
@@ -72,7 +75,6 @@ mod windows_clipboard {
         )
     }
     fn last_os_error(action: &str) -> io::Error {
-        // SAFETY: GetLastError 不接收参数，也不会解引用任何 Rust 指针。
         let code = unsafe { GetLastError() };
         if code == 0 {
             return io::Error::other(action.to_owned());
@@ -80,7 +82,6 @@ mod windows_clipboard {
         win32_error(action, code)
     }
     fn allocate_global_memory(size: usize) -> io::Result<Hglobal> {
-        // SAFETY: GlobalAlloc 只读取传入的大小和值，不会触碰 Rust 管理的内存。
         let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, size) };
         if memory.is_null() {
             return Err(last_os_error("分配全局内存失败"));
@@ -88,7 +89,6 @@ mod windows_clipboard {
         Ok(memory)
     }
     fn free_global_memory(memory: Hglobal) -> io::Result<()> {
-        // SAFETY: 句柄由 GlobalAlloc 返回，调用方保证这里传入的仍是待释放的全局内存句柄。
         let result = unsafe { GlobalFree(memory) };
         if result.is_null() {
             return Ok(());
@@ -96,7 +96,6 @@ mod windows_clipboard {
         Err(last_os_error("释放全局内存失败"))
     }
     fn lock_global_memory(memory: Hglobal) -> io::Result<*mut u8> {
-        // SAFETY: 句柄由 GlobalAlloc 返回，GlobalLock 只返回对应内存块的基地址。
         let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
         if pointer.is_null() {
             return Err(last_os_error("锁定全局内存失败"));
@@ -104,9 +103,7 @@ mod windows_clipboard {
         Ok(pointer)
     }
     fn unlock_global_memory(memory: Hglobal) -> io::Result<()> {
-        // SAFETY: 句柄已成功传给 GlobalLock，这里按 Win32 约定对同一块内存解锁。
         if unsafe { GlobalUnlock(memory) } == 0_i32 {
-            // SAFETY: GetLastError 不接收参数，也不会解引用任何 Rust 指针。
             let code = unsafe { GetLastError() };
             if code != 0 {
                 return Err(win32_error("解锁全局内存失败", code));
@@ -152,12 +149,10 @@ mod windows_clipboard {
             f_nc: 0_i32,
             f_wide: 1_i32,
         };
-        // SAFETY: buffer 指向一块至少 total_size 字节的可写全局内存，这里只复制固定大小的头部字节。
         unsafe {
             ptr::copy_nonoverlapping(ptr::from_ref(&header).cast::<u8>(), buffer, header_size);
         }
         let path_buffer = buffer.wrapping_add(header_size);
-        // SAFETY: path_buffer 指向头部之后的连续可写空间，长度至少为 path_bytes 字节。
         unsafe {
             ptr::copy_nonoverlapping(wide_path.as_ptr().cast::<u8>(), path_buffer, path_bytes);
         }
@@ -172,17 +167,14 @@ mod windows_clipboard {
         Ok(memory)
     }
     fn set_clipboard_file_drop(memory: Hglobal) -> io::Result<()> {
-        // SAFETY: 传入空窗口句柄表示当前任务线程访问系统剪贴板，不涉及 Rust 引用失效。
         if unsafe { OpenClipboard(null_mut()) } == 0_i32 {
             return Err(last_os_error("打开剪贴板失败"));
         }
         let operation_result = {
-            // SAFETY: 剪贴板已成功打开，按 Win32 约定可以直接清空其内容。
             let empty_result = unsafe { EmptyClipboard() };
             if empty_result == 0_i32 {
                 Err(last_os_error("清空剪贴板失败"))
             } else {
-                // SAFETY: memory 指向一块 GMEM_MOVEABLE 全局内存，格式与 CF_HDROP 要求一致。
                 let set_result = unsafe { SetClipboardData(CF_HDROP, memory.cast()) };
                 if set_result.is_null() {
                     Err(last_os_error("写入剪贴板失败"))
@@ -192,7 +184,6 @@ mod windows_clipboard {
             }
         };
         let close_result = {
-            // SAFETY: 只有当前函数打开了剪贴板，因此这里必须在返回前关闭。
             let close_status = unsafe { CloseClipboard() };
             if close_status == 0_i32 {
                 Err(last_os_error("关闭剪贴板失败"))
@@ -307,9 +298,9 @@ fn read_file_content(path: &Path) -> Result<String, Box<dyn core::error::Error>>
     if let Ok(text) = core::str::from_utf8(&bytes) {
         return Ok(text.to_owned());
     }
-    let mut detector = EncodingDetector::new();
+    let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
     detector.feed(&bytes, true);
-    let encoding = detector.guess(None, true);
+    let encoding = detector.guess(None, Utf8Detection::Allow);
     let (text, _, had_errors) = encoding.decode(&bytes);
     if !had_errors {
         return Ok(text.into_owned());
